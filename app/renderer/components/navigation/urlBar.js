@@ -415,8 +415,6 @@ class UrlBar extends React.Component {
       this.urlBarRef.style.setProperty('--navigation-progress-percent', percentString)
     }
 
-
-
     if (this.props.isSelected && !prevProps.isSelected) {
       this.select()
       windowActions.urlBarSelected(false)
@@ -629,7 +627,6 @@ class UrlBar extends React.Component {
 }
 
 const styles = StyleSheet.create({
-
 
   noScriptContainer: {
     display: 'flex',
