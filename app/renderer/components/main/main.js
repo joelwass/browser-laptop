@@ -540,6 +540,7 @@ class Main extends React.Component {
     const loginRequiredDetails = basicAuthState.getLoginRequiredDetail(state, activeTabId)
     const focused = isFocused(state)
     const isTor = frameStateUtil.isTor(activeFrame)
+    const torConnectionError = state.getIn(['tor', 'initializationError'])
 
     const props = {}
     // used in renderer
@@ -554,8 +555,9 @@ class Main extends React.Component {
     props.captionButtonsVisible = isWindows
     props.showContextMenu = currentWindow.has('contextMenuDetail')
     props.showPopupWindow = currentWindow.has('popupWindowDetail')
-    props.showSiteInfo = currentWindow.getIn(['ui', 'siteInfo', 'isVisible']) &&
-      !isSourceAboutUrl(activeFrame.get('location'))
+    props.showSiteInfo = (currentWindow.getIn(['ui', 'siteInfo', 'isVisible']) &&
+      !isSourceAboutUrl(activeFrame.get('location'))) ||
+      (torConnectionError && isTor)
     props.showBravery = shieldState.braveShieldsEnabled(activeFrame) &&
       !!currentWindow.get('braveryPanelDetail')
     props.showClearData = currentWindow.getIn(['ui', 'isClearBrowsingDataPanelVisible'], false)
