@@ -704,7 +704,7 @@ function hamburgerTemplateInit (location, e) {
   const template = [
     CommonMenu.newTabMenuItem(),
     CommonMenu.newPrivateTabMenuItem(),
-    CommonMenu.newTorTabMenuItem(),
+    CommonMenu.newTorTabMenuItem(false),
     CommonMenu.newPartitionedTabMenuItem(),
     CommonMenu.newWindowMenuItem(),
     CommonMenu.separatorMenuItem,
@@ -1244,6 +1244,9 @@ function mainTemplateInit (nodeProps, frame, tab) {
         info['menuItemId'] = extensionContextMenu.menuItemId
         if (extensionContextMenu.properties.parentId) {
           info['parentMenuItemId'] = extensionContextMenu.properties.parentId
+          if (!templateMap[extensionContextMenu.properties.parentId]) {
+            return
+          }
           if (templateMap[extensionContextMenu.properties.parentId].submenu === undefined) {
             templateMap[extensionContextMenu.properties.parentId].submenu = []
           }

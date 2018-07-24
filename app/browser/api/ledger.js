@@ -4,7 +4,6 @@
 
 'use strict'
 
-const acorn = require('acorn')
 const format = require('date-fns/format')
 const Immutable = require('immutable')
 const electron = require('electron')
@@ -16,7 +15,6 @@ const qr = require('qr-image')
 const underscore = require('underscore')
 const tldjs = require('tldjs')
 const urlFormat = require('url').format
-const levelUp = require('level')
 const random = require('random-lib')
 const uuid = require('uuid')
 const BigNumber = require('bignumber.js')
@@ -43,7 +41,6 @@ const locale = require('../../locale')
 const getSetting = require('../../../js/settings').getSetting
 const {getSourceAboutUrl, isSourceAboutUrl} = require('../../../js/lib/appUrlUtil')
 const urlParse = require('../../common/urlParse')
-const ruleSolver = require('../../extensions/brave/content/scripts/pageInformation')
 const request = require('../../../js/lib/request')
 const ledgerUtil = require('../../common/lib/ledgerUtil')
 const tabState = require('../../common/state/tabState')
@@ -71,8 +68,7 @@ const _internal = {
   verboseP: process.env.LEDGER_VERBOSE || false,
   debugP: process.env.LEDGER_DEBUG || false,
   ruleset: {
-    raw: [],
-    cooked: []
+    raw: []
   }
 }
 let userAgent = ''
@@ -89,18 +85,21 @@ let balanceTimeoutId = false
 let runTimeoutId
 let promotionTimeoutId
 let togglePromotionTimeoutId
-let verifiedTimeoutId = false
+let publisherInfoTimeoutId = false
+let publisherInfoUpdateIntervalId
+let promoRefFetchTimeoutId = false
 
-// Database
-let v2RulesetDB
-const v2RulesetPath = 'ledger-rulesV2.leveldb'
 const statePath = 'ledger-state.json'
+
+// Publisher info
+const publisherInfoPath = 'publisher-data.json'
+const publisherInfoUpdateInterval = ledgerUtil.milliseconds.day * 2
+let publisherInfoData = []
 
 // Definitions
 const clientOptions = {
   debugP: process.env.LEDGER_DEBUG,
   loggingP: process.env.LEDGER_LOGGING,
-  rulesTestP: process.env.LEDGER_RULES_TESTING,
   verboseP: process.env.LEDGER_VERBOSE,
   server: process.env.LEDGER_SERVER_URL,
   createWorker: electron.app.createWorker,
@@ -127,6 +126,8 @@ let referralAPI = 'key'
 if (clientOptions.environment === 'production') {
   referralServer = 'https://laptop-updates.brave.com'
   referralAPI = config.referralAPI || process.env.LEDGER_REFERRAL_API_KEY || ''
+} else {
+  referralAPI = process.env.LEDGER_REFERRAL_API_KEY || referralAPI
 }
 
 const fileTypes = {
@@ -169,7 +170,7 @@ if (ipc) {
     if (!event.sender.isDestroyed()) {
       event.sender.send(messages.LEDGER_PUBLISHER_RESPONSE + '-' + location, {
         context: ctx,
-        rules: _internal.ruleset.cooked
+        rules: _internal.ruleset.raw
       })
     }
   })
@@ -182,16 +183,20 @@ const paymentPresent = (state, tabId, present) => {
   } else {
     delete ledgerPaymentsPresent[tabId]
   }
-
-  if (getSetting(settings.PAYMENTS_ENABLED) && present) {
-    if (!balanceTimeoutId) {
-      module.exports.getBalance(state)
-    }
-
+  if (present) {
     appActions.onPromotionGet()
 
-    state = checkSeed(state)
-    getPublisherTimestamp(true)
+    if (togglePromotionTimeoutId) {
+      clearTimeout(togglePromotionTimeoutId)
+    }
+    if (getSetting(settings.PAYMENTS_ENABLED)) {
+      if (!balanceTimeoutId) {
+        module.exports.getBalance(state)
+      }
+
+      state = checkSeed(state)
+      runPublishersUpdate(state)
+    }
   } else if (balanceTimeoutId) {
     clearTimeout(balanceTimeoutId)
     balanceTimeoutId = false
@@ -226,18 +231,81 @@ const checkSeed = (state) => {
   return state
 }
 
-const getPublisherTimestamp = (updateList) => {
+const getPublisherInfo = () => {
   if (!client) {
     return
   }
 
-  client.publisherTimestamp((err, result) => {
+  client.fetchPublisherInfo((err, result) => {
     if (err) {
-      console.error('Error while retrieving publisher timestamp', err.toString())
+      console.error('Error while retrieving verified publishers', err.toString())
       return
     }
-    appActions.onPublisherTimestamp(result.timestamp, updateList)
+    appActions.onPublishersInfoReceived(result)
   })
+}
+
+const checkPublisherInfoUpdate = (state) => {
+  const verifiedPTimestamp = updateState.getUpdateProp(state, 'verifiedPublishersTimestamp') || null
+
+  if (
+    verifiedPTimestamp == null ||
+    (new Date().getTime() - verifiedPTimestamp) >= publisherInfoUpdateInterval
+  ) {
+    if (publisherInfoTimeoutId) {
+      clearTimeout(publisherInfoTimeoutId)
+    }
+
+    // Startup and boot delay
+    const delay = (!bootP || !client) ? (ledgerUtil.milliseconds.second * 15) : 0
+
+    publisherInfoTimeoutId = setTimeout(() => {
+      module.exports.getPublisherInfo()
+    }, delay)
+  }
+}
+
+const updatePublishersInfo = (state, publisherKeys, publisherData) => {
+  if (publisherData == null || publisherKeys == null) {
+    return state
+  }
+
+  let updateData = []
+
+  if (!isList(publisherKeys)) {
+    publisherKeys = Immutable.List([publisherKeys])
+  }
+
+  publisherData = makeImmutable(publisherData)
+
+  const publishers = publisherData.filter(p => publisherKeys.indexOf(p.first()) > -1)
+  publishers.forEach((publisher) => {
+    const verified = !!publisher.get(1)
+    const publisherKey = publisher.get(0)
+
+    savePublisherOption(publisherKey, 'verified', verified)
+
+    updateData.push({
+      verified,
+      publisherKey
+    })
+  })
+
+  if (updateData.length > 0) {
+    appActions.onPublishersOptionUpdate(updateData)
+  }
+
+  if (process.env.NODE_ENV === 'test') {
+    ['brianbondy.com', 'clifton.io'].forEach((key) => {
+      if (ledgerState.hasPublisher(state, key)) {
+        state = ledgerState.setPublisherOption(state, key, 'verified', true)
+        savePublisherOption(key, 'verified', true)
+      }
+    })
+    state = updatePublisherInfo(state)
+  }
+
+  return state
 }
 
 const addFoundClosed = (state) => {
@@ -270,8 +338,6 @@ const onBootStateFile = (state) => {
   try {
     clientprep()
     client = ledgerClient(null, underscore.extend({roundtrip: module.exports.roundtrip}, clientOptions), null)
-
-    getPublisherTimestamp()
   } catch (ex) {
     state = ledgerState.resetInfo(state)
     bootP = false
@@ -588,138 +654,93 @@ const updatePublisherInfo = (state, changedPublisher, refresh = false) => {
   return state
 }
 
-const inspectP = (db, path, publisher, property, key, callback) => {
-  const done = (err, result) => {
-    if (callback) {
-      if (err) {
-        callback(err, null)
-        return
-      }
+const runPublishersUpdate = (state) => {
+  const publishers = ledgerState.getPublishers(state)
 
-      callback(err, result[property])
-    }
+  if (publishers.isEmpty()) {
+    return
   }
 
-  if (!key) key = publisher
-  db.get(key, (err, value) => {
-    let result
-
-    if (err) {
-      if (!err.notFound) console.error(path + ' get ' + key + ' error: ' + JSON.stringify(err, null, 2))
-      return done(err)
-    }
-
-    try {
-      result = JSON.parse(value)
-    } catch (ex) {
-      console.error(v2RulesetPath + ' stream invalid JSON ' + key + ': ' + value)
-      result = {}
-    }
-
-    done(null, result)
-  })
+  module.exports.updatePublishers(state, Array.from(publishers.keys()))
 }
 
-// TODO rename function name
-const verifiedP = (state, publisherKey, callback, lastUpdate) => {
-  const clientCallback = (err, result) => {
+const updatePublishers = (state, publisherKeys) => {
+  const fs = require('fs')
+
+  if (publisherInfoData && publisherInfoData.size > 0) {
+    appActions.onPublishersInfoRead(publisherKeys, publisherInfoData)
+    return state
+  }
+
+  fs.readFile(pathName(publisherInfoPath), (err, data) => {
     if (err) {
-      console.error(`Error verifying publisher ${publisherKey}: `, err.toString())
+      console.error('Error: Could not read from publishers file')
       return
     }
 
-    if (callback) {
-      if (result) {
-        callback(null, result, lastUpdate)
-      } else {
-        callback(err, {})
-      }
+    try {
+      const result = JSON.parse(data)
+      publisherInfoData = makeImmutable(result)
+      appActions.onPublishersInfoRead(publisherKeys, publisherInfoData)
+    } catch (err) {
+      console.error(`Error: Could not parse data from publishers file`)
     }
-  }
-
-  if (Array.isArray(publisherKey)) {
-    client.publishersInfo(publisherKey, clientCallback)
-  } else {
-    client.publisherInfo(publisherKey, clientCallback)
-  }
-
-  if (process.env.NODE_ENV === 'test') {
-    ['brianbondy.com', 'clifton.io'].forEach((key) => {
-      if (ledgerState.hasPublisher(state, key)) {
-        state = ledgerState.setPublisherOption(state, key, 'verified', true)
-        savePublisherOption(publisherKey, 'verified', true)
-      }
-    })
-    state = updatePublisherInfo(state)
-  }
+  })
 
   return state
 }
 
-// TODO rename function
-const excludeP = (publisherKey, callback) => {
-  let doneP
-
-  const done = (err, result) => {
-    doneP = true
-    callback(err, result)
+const shouldExclude = (publisherKey) => {
+  // Check for the .gov suffix, we should exclude governmental sites
+  const suffix = tldjs.getPublicSuffix(publisherKey)
+  if (suffix === 'gov') {
+    return true
   }
 
-  if (!v2RulesetDB) {
-    return setTimeout(() => excludeP(publisherKey, callback), 5 * ledgerUtil.milliseconds.second)
+  const domain = tldjs.getDomain(publisherKey)
+  // Checks for government site edge cases, such as aces.gov.in, gov.ie, nenkin.go.jp
+  // These were previously used in the bat-client default ruleset
+  const sldGovRegex = /^[a-z][a-z].gov$/
+  const sfxGovRegex1 = /^go.[a-z][a-z]$/
+  const sfxGovRegex2 = /^gov.[a-z][a-z]$/
+
+  if (
+    sldGovRegex.test(domain) ||
+    sfxGovRegex1.test(suffix) ||
+    sfxGovRegex2.test(suffix)
+  ) {
+    return true
   }
 
-  inspectP(v2RulesetDB, v2RulesetPath, publisherKey, 'exclude', 'domain:' + publisherKey, (err, result) => {
-    if (!err) {
-      return done(err, result)
-    }
+  // Public keybase users should also be excluded
+  if (domain === 'keybase.pub') {
+    return true
+  }
 
-    let props = ledgerPublisher.getPublisherProps(publisherKey)
-    if (!props) return done()
+  return false
+}
 
-    v2RulesetDB.createReadStream({lt: 'domain:'}).on('data', (data) => {
-      if (doneP) return
+const doneP = (err, result, callback) => {
+  callback(err, result)
+}
 
-      const sldP = data.key.indexOf('SLD:') === 0
-      const tldP = data.key.indexOf('TLD:') === 0
-      if (!tldP && !sldP) return
+const getPublisherExclude = (publisherKey, callback) => {
+  if (!publisherInfoData) {
+    return setTimeout(() => module.exports.getPublisherExclude(publisherKey, callback), 15 * ledgerUtil.milliseconds.second)
+  }
 
-      if (underscore.intersection(data.key.split(''),
-          ['^', '$', '*', '+', '?', '[', '(', '{', '|']).length === 0) {
-        if (data.key !== ('TLD:' + props.TLD) && (props.SLD && data.key !== ('SLD:' + props.SLD.split('.')[0]))) {
-          return
-        }
-      } else {
-        try {
-          const regexp = new RegExp(data.key.substr(4))
-          if (!regexp.test(props[tldP ? 'TLD' : 'SLD'])) return
-        } catch (ex) {
-          console.error(v2RulesetPath + ' stream invalid regexp ' + data.key + ': ' + ex.toString())
-        }
-      }
+  const publisher = publisherInfoData.find(p => p.first() === publisherKey)
+  const result = typeof publisher === 'undefined'
+    ? module.exports.shouldExclude(publisherKey)
+    : !!publisher.get(2)
 
-      let result
-      try {
-        result = JSON.parse(data.value)
-      } catch (ex) {
-        console.error(v2RulesetPath + ' stream invalid JSON ' + data.entry + ': ' + data.value)
-      }
-
-      done(null, result.exclude)
-    }).on('error', (err) => {
-      console.error(v2RulesetPath + ' stream error: ' + JSON.stringify(err, null, 2))
-    }).on('close', () => {
-    }).on('end', () => {
-      if (!doneP) done(null, false)
-    })
-  })
+  return module.exports.doneP(null, result, callback)
 }
 
 const addSiteVisit = (state, timestamp, location, tabId, manualAdd = false) => {
   if (!synopsis || location == null) {
     return state
   }
-
   const protocol = urlParse(location).protocol
   location = pageDataUtil.getInfoKey(location)
 
@@ -790,48 +811,7 @@ const saveVisit = (state, publisherKey, options) => {
   return state
 }
 
-const onVerifiedPStatus = (error, result, lastUpdate) => {
-  if (error || result == null) {
-    return
-  }
-
-  if (!Array.isArray(result)) {
-    result = [result]
-  }
-
-  if (result.length === 0) {
-    return
-  }
-
-  const data = result.reduce((publishers, item) => {
-    if (item.err) {
-      return publishers
-    }
-
-    const publisherKey = item.publisher
-    let verified = false
-    if (item && item.properties) {
-      verified = !!item.properties.verified
-      savePublisherOption(publisherKey, 'verified', verified)
-    }
-
-    savePublisherOption(publisherKey, 'verifiedTimestamp', lastUpdate)
-
-    publishers.push({
-      publisherKey,
-      verified,
-      verifiedTimestamp: lastUpdate
-    })
-
-    return publishers
-  }, [])
-
-  if (data && data.length > 0) {
-    appActions.onPublishersOptionUpdate(data)
-  }
-}
-
-const checkVerifiedStatus = (state, publisherKeys, publisherTimestamp) => {
+const checkVerifiedStatus = (state, publisherKeys) => {
   if (publisherKeys == null) {
     return state
   }
@@ -840,23 +820,7 @@ const checkVerifiedStatus = (state, publisherKeys, publisherTimestamp) => {
     publisherKeys = [publisherKeys]
   }
 
-  const lastUpdate = parseInt(publisherTimestamp || ledgerState.getLedgerValue(state, 'publisherTimestamp'))
-  const checkKeys = publisherKeys.reduce((init, key) => {
-    const lastPublisherUpdate = parseInt(ledgerState.getPublisherOption(state, key, 'verifiedTimestamp') || 0)
-
-    if (lastUpdate > lastPublisherUpdate) {
-      init.push(key)
-    }
-
-    return init
-  }, [])
-
-  if (checkKeys.length === 0) {
-    return state
-  }
-
-  state = module.exports.verifiedP(state, checkKeys, onVerifiedPStatus, lastUpdate)
-
+  state = module.exports.updatePublishers(state, publisherKeys)
   return state
 }
 
@@ -1047,6 +1011,7 @@ const pageDataChanged = (state, viewData = {}, keepInfo = false) => {
   const locationData = ledgerState.getLocation(state, locationKey)
   let publisherKey = locationData.get('publisher')
   let publisher = ledgerState.getPublisher(state, publisherKey)
+
   if (!publisher.isEmpty()) {
     if (publisher.get('faviconURL') == null) {
       state = getFavIcon(state, publisherKey, info)
@@ -1065,7 +1030,11 @@ const pageDataChanged = (state, viewData = {}, keepInfo = false) => {
       }
     }
 
-    if (!publisherKey || (ledgerUtil.blockedP(state, publisherKey))) {
+    if (!publisherKey) {
+      publisherKey = tldjs.getDomain(locationKey)
+    }
+
+    if (ledgerUtil.blockedP(state, publisherKey)) {
       publisherKey = null
     }
 
@@ -1089,7 +1058,7 @@ const pageDataChanged = (state, viewData = {}, keepInfo = false) => {
         appActions.onPublisherOptionUpdate(publisherKey, 'exclude', true)
         savePublisherOption(publisherKey, 'exclude', true)
       } else {
-        excludeP(publisherKey, (unused, exclude) => {
+        getPublisherExclude(publisherKey, (unused, exclude) => {
           appActions.onPublisherOptionUpdate(publisherKey, 'exclude', exclude)
           savePublisherOption(publisherKey, 'exclude', exclude)
         })
@@ -1100,6 +1069,38 @@ const pageDataChanged = (state, viewData = {}, keepInfo = false) => {
   }
 
   state = addNewLocation(state, location, tabId, keepInfo)
+  appActions.onCheckBrowserActivityTime()
+
+  return state
+}
+
+const checkBrowserActivityTime = (state) => {
+  // Fuzzing threshold
+  const minTime = 30 * ledgerUtil.milliseconds.minute
+  const publishers = ledgerState.getPublishers(state)
+
+  if (publishers.isEmpty()) {
+    return state
+  }
+
+  const ledgerStatus = ledgerState.getAboutProp(state, 'status')
+  const curBrowsingTime = ledgerState.getAboutProp(state, 'browsingTime') || 0
+
+  // Check cached browsing time to avoid unneeded recalculation
+  if (curBrowsingTime >= minTime || ledgerStatus !== ledgerStatuses.FUZZING) {
+    return state
+  }
+
+  const browsingTime = publishers.reduce((acc, publisher) => {
+    return acc + publisher.get('duration')
+  }, 0)
+
+  // Cache browsing time
+  state = ledgerState.setAboutProp(state, 'browsingTime', browsingTime)
+
+  if (browsingTime >= minTime && ledgerStatus === ledgerStatuses.FUZZING) {
+    state = ledgerState.setAboutProp(state, 'status', '')
+  }
 
   return state
 }
@@ -1300,7 +1301,7 @@ const initSynopsis = (state) => {
     const publisher = item[1] || Immutable.Map()
 
     if (!publisher.getIn(['options', 'exclude'])) {
-      excludeP(publisherKey, (unused, exclude) => {
+      getPublisherExclude(publisherKey, (unused, exclude) => {
         appActions.onPublisherOptionUpdate(publisherKey, 'exclude', exclude)
         savePublisherOption(publisherKey, 'exclude', exclude)
       })
@@ -1325,23 +1326,26 @@ const checkPromotions = () => {
   }, random.randomInt({min: 20 * ledgerUtil.milliseconds.hour, max: 24 * ledgerUtil.milliseconds.hour}))
 }
 
+const runPromotionCheck = () => {
+  // on start
+  if (togglePromotionTimeoutId) {
+    clearTimeout(togglePromotionTimeoutId)
+  }
+
+  togglePromotionTimeoutId = setTimeout(() => {
+    checkPromotions()
+  }, process.env.LEDGER_ENVIRONMENT === 'staging'
+    ? random.randomInt({min: 10 * ledgerUtil.milliseconds.second, max: 15 * ledgerUtil.milliseconds.second})
+    : random.randomInt({min: 45 * ledgerUtil.milliseconds.second, max: 60 * ledgerUtil.milliseconds.second})
+  )
+}
+
 const enable = (state, paymentsEnabled) => {
   if (paymentsEnabled) {
     if (!getSetting(settings.PAYMENTS_NOTIFICATION_TRY_PAYMENTS_DISMISSED)) {
       appActions.changeSetting(settings.PAYMENTS_NOTIFICATION_TRY_PAYMENTS_DISMISSED, true)
     }
-  }
 
-  if (paymentsEnabled === getSetting(settings.PAYMENTS_ENABLED)) {
-    // on start
-    if (togglePromotionTimeoutId) {
-      clearTimeout(togglePromotionTimeoutId)
-    }
-
-    togglePromotionTimeoutId = setTimeout(() => {
-      checkPromotions()
-    }, random.randomInt({min: 10 * ledgerUtil.milliseconds.second, max: 15 * ledgerUtil.milliseconds.second}))
-  } else if (paymentsEnabled) {
     // toggle on
     if (togglePromotionTimeoutId) {
       clearTimeout(togglePromotionTimeoutId)
@@ -1406,75 +1410,6 @@ const pathName = (name) => {
 
   const parts = path.parse(name)
   return path.join(electron.app.getPath('userData'), parts.dir, `${parts.name}${parts.ext}`)
-}
-
-const cacheRuleSet = (state, ruleset) => {
-  if (!ruleset || underscore.isEqual(_internal.ruleset.raw, ruleset)) {
-    return state
-  }
-
-  try {
-    let stewed = []
-    ruleset.forEach((rule) => {
-      let entry = {condition: acorn.parse(rule.condition)}
-
-      if (rule.dom) {
-        if (rule.dom.publisher) {
-          entry.publisher = {
-            selector: rule.dom.publisher.nodeSelector,
-            consequent: acorn.parse(rule.dom.publisher.consequent)
-          }
-        }
-        if (rule.dom.faviconURL) {
-          entry.faviconURL = {
-            selector: rule.dom.faviconURL.nodeSelector,
-            consequent: acorn.parse(rule.dom.faviconURL.consequent)
-          }
-        }
-      }
-      if (!entry.publisher) entry.consequent = rule.consequent ? acorn.parse(rule.consequent) : rule.consequent
-
-      stewed.push(entry)
-    })
-
-    _internal.ruleset.raw = ruleset
-    _internal.ruleset.cooked = stewed
-    if (!synopsis) {
-      return state
-    }
-
-    let syncP = false
-    const publishers = ledgerState.getPublishers(state)
-    for (let item of publishers) {
-      const publisherKey = item[0]
-      const publisher = item[1]
-      const ctx = ledgerPublisher.getPublisherProps(publisherKey)
-
-      if (!ctx.TLD) continue
-
-      if (publisher.publisherURL) ctx.URL = publisher.publisherURL
-      if (!ctx.URL) ctx.URL = (publisher.get('protocol') || 'https:') + '//' + publisherKey
-
-      stewed.forEach((rule) => {
-        if (rule.consequent !== null || rule.dom) return
-        if (!ruleSolver.resolve(rule.condition, ctx)) return
-
-        if (_internal.verboseP) console.log('\npurging ' + publisherKey)
-        delete synopsis.publishers[publisher]
-        state = ledgerState.deletePublishers(state, publisherKey)
-        syncP = true
-      })
-    }
-
-    if (!syncP) {
-      return state
-    }
-
-    return updatePublisherInfo(state)
-  } catch (ex) {
-    console.error('ruleset error: ', ex)
-    return state
-  }
 }
 
 const clientprep = () => {
@@ -1573,14 +1508,8 @@ const roundtrip = (params, options, callback) => {
   parts = underscore.extend(underscore.pick(parts, ['protocol', 'hostname', 'port']),
     underscore.omit(params, ['headers', 'payload', 'timeout']))
 
-// TBD: let the user configure this via preferences [MTR]
-  if (params.useProxy) {
-    if (parts.hostname === 'ledger.brave.com') {
-      parts.hostname = 'ledger-proxy.privateinternetaccess.com'
-    } else if (parts.hostname === 'ledger.mercury.basicattentiontoken.org') {
-      parts.hostname = 'mercury-proxy.privateinternetaccess.com'
-    }
-  }
+  // Use alternate hostname if it's provided
+  parts.hostname = params.altHostname || parts.hostname
 
   const i = parts.path.indexOf('?')
   if (i !== -1) {
@@ -1623,11 +1552,6 @@ const roundtrip = (params, options, callback) => {
     if (err) return callback(err, response)
 
     if (Math.floor(response.statusCode / 100) !== 2) {
-      if (params.useProxy && response.statusCode === 403) {
-        params.useProxy = false
-        return module.exports.roundtrip(params, options, callback)
-      }
-
       return callback(
         new Error('HTTP response ' + response.statusCode + ' for ' + params.method + ' ' + params.path),
         response)
@@ -2114,9 +2038,6 @@ const callback = (err, result, delayTime) => {
 }
 
 const onCallback = (state, result, delayTime) => {
-  let results
-  let entries = client && client.report()
-
   if (!result) {
     run(state, delayTime)
     return state
@@ -2154,44 +2075,17 @@ const onCallback = (state, result, delayTime) => {
   }
 
   if (notInProgress) {
-    state = module.exports.cacheRuleSet(state, regularResults.ruleset)
-    if (result.has('rulesetV2')) {
-      results = regularResults.rulesetV2 // TODO optimize if possible
-      delete regularResults.rulesetV2
+    const publishers = ledgerState.getPublishers(state)
+    for (let item of publishers) {
+      const publisherKey = item[0]
+      const publisher = item[1] || Immutable.Map()
 
-      entries = []
-      results.forEach((entry) => {
-        const key = entry.facet + ':' + entry.publisher
-
-        if (entry.exclude !== false) {
-          entries.push({type: 'put', key: key, value: JSON.stringify(underscore.omit(entry, ['facet', 'publisher']))})
-        } else {
-          entries.push({type: 'del', key: key})
-        }
-      })
-
-      v2RulesetDB.batch(entries, (err) => {
-        if (err) return console.error(v2RulesetPath + ' error: ' + JSON.stringify(err, null, 2))
-
-        if (entries.length === 0) return
-
-        const publishers = ledgerState.getPublishers(state)
-        for (let item of publishers) {
-          const publisherKey = item[0]
-          const publisher = item[1] || Immutable.Map()
-
-          if (!publisher.getIn(['options', 'exclude'])) {
-            excludeP(publisherKey, (unused, exclude) => {
-              appActions.onPublisherOptionUpdate(publisherKey, 'exclude', exclude)
-              savePublisherOption(publisherKey, 'exclude', exclude)
-            })
-          }
-        }
-      })
-    }
-
-    if (result.has('publishersV2')) {
-      delete regularResults.publishersV2
+      if (!publisher.getIn(['options', 'exclude'])) {
+        getPublisherExclude(publisherKey, (unused, exclude) => {
+          appActions.onPublisherOptionUpdate(publisherKey, 'exclude', exclude)
+          savePublisherOption(publisherKey, 'exclude', exclude)
+        })
+      }
     }
   }
 
@@ -2310,14 +2204,9 @@ const onFetchReferralHeaders = (state, err, response, body) => {
 const initialize = (state, paymentsEnabled) => {
   let fs
 
-  if (!v2RulesetDB) v2RulesetDB = levelUp(pathName(v2RulesetPath))
   state = enable(state, paymentsEnabled)
 
   ledgerNotifications.init()
-
-  if (verifiedTimeoutId) {
-    clearInterval(verifiedTimeoutId)
-  }
 
   if (!userAgent) {
     const versionInformation = state.getIn(['about', 'brave', 'versionInformation'])
@@ -2332,43 +2221,34 @@ const initialize = (state, paymentsEnabled) => {
     }
   }
 
-  if (updateState.getUpdateProp(state, 'referralDownloadId') == null) {
-    promoCodeFirstRunStorage
-      .readFirstRunPromoCode()
-      .then((code) => {
-        onReferralCodeRead(code)
-      })
-      .catch(error => {
-        if (clientOptions.verboseP) {
-          console.error('read error: ' + error.toString())
-        }
-        fetchReferralHeaders()
-      })
-  } else {
-    fetchReferralHeaders()
-  }
-
   // Get referral headers every day
   setInterval(() => fetchReferralHeaders, (24 * ledgerUtil.milliseconds.hour))
 
-  if (!paymentsEnabled) {
-    client = null
-    return ledgerState.resetInfo(state, true)
+  if (paymentsEnabled) {
+    // First run
+    module.exports.checkPublisherInfoUpdate(state)
+    // Check again every other day
+    publisherInfoUpdateIntervalId = setInterval(() => {
+      module.exports.checkPublisherInfoUpdate(state)
+    }, publisherInfoUpdateInterval)
   }
 
-  verifiedTimeoutId = setInterval(getPublisherTimestamp, 1 * ledgerUtil.milliseconds.hour)
+  if (!paymentsEnabled) {
+    client = null
+    if (publisherInfoUpdateIntervalId) {
+      clearInterval(publisherInfoUpdateIntervalId)
+    }
+    return ledgerState.resetInfo(state, true)
+  }
 
   if (client) {
     return state
   }
 
   if (!ledgerPublisher) ledgerPublisher = require('bat-publisher')
-  let ruleset = []
   if (typeof ledgerPublisher.ruleset === 'function') ledgerPublisher.ruleset = ledgerPublisher.ruleset()
-  ledgerPublisher.ruleset.forEach(rule => {
-    if (rule.consequent) ruleset.push(rule)
-  })
-  state = cacheRuleSet(state, ruleset)
+
+  _internal.ruleset.raw = ledgerPublisher.ruleset
 
   try {
     if (!fs) fs = require('fs')
@@ -2407,6 +2287,39 @@ const initialize = (state, paymentsEnabled) => {
     state = ledgerState.resetInfo(state)
     return state
   }
+}
+
+const schedulePromoRefFetch = () => {
+  if (promoRefFetchTimeoutId) {
+    clearTimeout(promoRefFetchTimeoutId)
+  }
+
+  promoRefFetchTimeoutId = setTimeout(() => {
+    appActions.onPromoRefFetch()
+  }, random.randomInt({min: 50 * ledgerUtil.milliseconds.second, max: 70 * ledgerUtil.milliseconds.second}))
+}
+
+const onRunPromoRefFetch = (state) => {
+  if (updateState.getUpdateProp(state, 'referralDownloadId') == null) {
+    module.exports.firstRunPromoCode()
+  } else {
+    module.exports.fetchReferralHeaders()
+  }
+  return state
+}
+
+const firstRunPromoCode = () => {
+  promoCodeFirstRunStorage
+    .readFirstRunPromoCode()
+    .then((code) => {
+      onReferralCodeRead(code)
+    })
+    .catch(error => {
+      if (clientOptions.verboseP) {
+        console.error('read error: ' + error.toString())
+      }
+      fetchReferralHeaders()
+    })
 }
 
 const getContributionAmount = (state) => {
@@ -2453,7 +2366,7 @@ const onInitRead = (state, parsedData) => {
       underscore.extend(parsedData.options, {roundtrip: module.exports.roundtrip}, options),
       parsedData)
 
-    getPublisherTimestamp(true)
+    runPublishersUpdate(state)
 
     // Scenario: User enables Payments, disables it, waits 30+ days, then
     // enables it again -> reconcileStamp is in the past.
@@ -2512,8 +2425,7 @@ const onLedgerFirstSync = (state, parsedData) => {
   if (client.sync(callback) === true) {
     run(state, random.randomInt({min: ledgerUtil.milliseconds.minute, max: 5 * ledgerUtil.milliseconds.minute}))
   }
-
-  return cacheRuleSet(state, parsedData.ruleset)
+  return state
 }
 
 const init = (state) => {
@@ -2965,7 +2877,7 @@ const onMediaPublisher = (state, mediaKey, response, duration, revisited) => {
       appActions.onPublisherOptionUpdate(publisherKey, 'exclude', true)
       savePublisherOption(publisherKey, 'exclude', true)
     } else {
-      excludeP(publisherKey, (unused, exclude) => {
+      getPublisherExclude(publisherKey, (unused, exclude) => {
         appActions.onPublisherOptionUpdate(publisherKey, 'exclude', exclude)
         savePublisherOption(publisherKey, 'exclude', exclude)
       })
@@ -3138,17 +3050,29 @@ const onPromotionResponse = (state, status) => {
   return state
 }
 
-const onPublisherTimestamp = (state, oldTimestamp, newTimestamp) => {
-  if (oldTimestamp === newTimestamp) {
-    return
+const onPublishersInfo = (state, result) => {
+  if (!result) {
+    return state
   }
 
-  const publishers = ledgerState.getPublishers(state)
-  if (publishers.isEmpty()) {
-    return
-  }
+  const fs = require('fs')
+  const path = pathName(publisherInfoPath)
+  const writeData = JSON.stringify(result)
 
-  module.exports.checkVerifiedStatus(state, Array.from(publishers.keys()), newTimestamp)
+  publisherInfoData = makeImmutable(result)
+
+  fs.writeFile(path, writeData, (err) => {
+    if (err) {
+      console.error(`Error: Could not write file at ${path}`)
+      return
+    }
+    if (clientOptions.verboseP) {
+      console.log(`Publishers file written successfully at ${path}`)
+    }
+    appActions.onPublishersInfoWrite()
+  })
+
+  return state
 }
 
 const checkReferralActivity = (state) => {
@@ -3291,7 +3215,7 @@ const getMethods = () => {
     setPaymentInfo,
     updatePublisherInfo,
     networkConnected,
-    verifiedP,
+    updatePublishers,
     boot,
     onBootStateFile,
     onWalletProperties,
@@ -3323,7 +3247,6 @@ const getMethods = () => {
     getBalance,
     fileRecoveryKeys,
     getPromotion,
-    onPublisherTimestamp,
     checkVerifiedStatus,
     checkReferralActivity,
     setPublishersOptions,
@@ -3342,8 +3265,21 @@ const getMethods = () => {
     clearPaymentHistory,
     getPaymentInfo,
     synopsisNormalizer,
-    cacheRuleSet,
-    disablePayments
+    disablePayments,
+    runPromotionCheck,
+    onPublishersInfo,
+    getPublisherInfo,
+    checkPublisherInfoUpdate,
+    updatePublishersInfo,
+    runPublishersUpdate,
+    checkBrowserActivityTime,
+    firstRunPromoCode,
+    fetchReferralHeaders,
+    schedulePromoRefFetch,
+    onRunPromoRefFetch,
+    getPublisherExclude,
+    doneP,
+    shouldExclude
   }
 
   let privateMethods = {}
@@ -3368,6 +3304,12 @@ const getMethods = () => {
       setClient: (data) => {
         client = data
       },
+      getPublisherInfoData: () => {
+        return publisherInfoData
+      },
+      setPublisherInfoData: (data) => {
+        publisherInfoData = data
+      },
       setCurrentMediaKey: (key) => {
         currentMediaKey = key
       },
@@ -3384,7 +3326,6 @@ const getMethods = () => {
       onReferralInit,
       roundTripFromWindow,
       onReferralCodeRead,
-      onVerifiedPStatus,
       onFuzzing,
       checkSeed,
       shouldTrackTab

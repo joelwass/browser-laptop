@@ -189,6 +189,7 @@ AppStore
   },
   ledger: {
     about: {
+      browsingTime: number, // A total of publisher visit time
       synopsis: Array.Object,
       synopsisOptions: Object
     },
@@ -342,7 +343,6 @@ AppStore
         }
       }
     }
-    publisherTimestamp: number, // timestamp of last publisher update in the database
     status: string, // ledger status
     synopsis: {
       options: {
@@ -366,7 +366,6 @@ AppStore
           options: {
             exclude: boolean, // publisher should not be included, toggle is off
             verified: boolean,
-            verifiedTimestamp: number, // timestamp of the last change
             stickyP: boolean
           },
           pinPercentage: number,
@@ -609,7 +608,8 @@ AppStore
   },
   tor: {
     percentInitialized: number, // percentage initialized
-    initializationError: string|boolean, // error message. false means successfully initialized.
+    error: string, // error message. null means no error.
+    online: boolean, // true if tor is online, false if not
   },
   updates: {
     lastCheckTimestamp: boolean,

@@ -641,6 +641,21 @@ const appActions = {
   },
 
   /**
+   * Handles user response to a notifcation
+   * @param {string} message
+   * @param {number} buttonIndex
+   * @param {object} activeWindow
+   */
+  onNotificationResponse: function (message, buttonIndex, activeWindow) {
+    dispatch({
+      actionType: appConstants.APP_ON_NOTIFICATION_RESPONSE,
+      message,
+      buttonIndex,
+      activeWindow
+    })
+  },
+
+  /**
    * Adds information about pending basic auth login requests
    * @param {number} tabId - The tabId that generated the request
    * @param {string} detail - login request info
@@ -1824,6 +1839,27 @@ const appActions = {
     })
   },
 
+  onPublishersInfoReceived: function (result) {
+    dispatch({
+      actionType: appConstants.APP_ON_PUBLISHERS_INFO_RECEIVED,
+      result
+    })
+  },
+
+  onPublishersInfoWrite: function () {
+    dispatch({
+      actionType: appConstants.APP_ON_PUBLISHERS_INFO_WRITE
+    })
+  },
+
+  onPublishersInfoRead: function (keys, data) {
+    dispatch({
+      actionType: appConstants.APP_ON_PUBLISHERS_INFO_READ,
+      keys,
+      data
+    })
+  },
+
   /**
    * Dispatches a message that window was resized
    * @param windowValue - window properties
@@ -1848,14 +1884,6 @@ const appActions = {
       actionType: appConstants.APP_ADD_PUBLISHER_TO_LEDGER,
       location,
       tabId
-    })
-  },
-
-  onPublisherTimestamp: function (timestamp, updateList) {
-    dispatch({
-      actionType: appConstants.APP_ON_PUBLISHER_TIMESTAMP,
-      timestamp,
-      updateList
     })
   },
 
@@ -2065,16 +2093,10 @@ const appActions = {
     })
   },
 
-  onTorInitError: function (message) {
+  onTorError: function (message) {
     dispatch({
-      actionType: appConstants.APP_ON_TOR_INIT_ERROR,
+      actionType: appConstants.APP_ON_TOR_ERROR,
       message
-    })
-  },
-
-  onTorInitSuccess: function () {
-    dispatch({
-      actionType: appConstants.APP_ON_TOR_INIT_SUCCESS
     })
   },
 
@@ -2082,6 +2104,13 @@ const appActions = {
     dispatch({
       actionType: appConstants.APP_ON_TOR_INIT_PERCENTAGE,
       percentage
+    })
+  },
+
+  onTorOnline: function (online) {
+    dispatch({
+      actionType: appConstants.APP_ON_TOR_ONLINE,
+      online
     })
   },
 
@@ -2105,6 +2134,18 @@ const appActions = {
       torEnabled,
       tabId,
       index
+    })
+  },
+
+  onCheckBrowserActivityTime: function () {
+    dispatch({
+      actionType: appConstants.APP_ON_CHECK_BROWSER_ACTIVITY_TIME
+    })
+  },
+
+  onPromoRefFetch: function () {
+    dispatch({
+      actionType: appConstants.APP_ON_PROMO_REF_FETCH
     })
   }
 }

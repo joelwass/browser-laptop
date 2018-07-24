@@ -149,20 +149,36 @@ class TorDaemon extends EventEmitter {
   }
 
   /**
-   * Kill the tor daemon.
+   * Stop watching for the tor daemon to start up.
    */
-  kill () {
+  stop () {
     assert(this._watcher)
     this._watcher.close()
     this._watcher = null
+  }
+
+  /**
+   * Kill the tor daemon and close the control channel.
+   */
+  kill () {
     if (!this._process) {
       assert(this._process === null)
       assert(this._control === null)
       return
     }
     if (this._control) {
-      this._control.close()
+      this._control.destroy()
     }
+  }
+
+  /**
+   * Internal subroutine.  Report an error and kill the daemon.
+   *
+   * @param {string} msg - error message
+   */
+  _error (msg) {
+    this.emit('error', msg)
+    this.kill()
   }
 
   /**
@@ -295,6 +311,7 @@ class TorDaemon extends EventEmitter {
   _polled () {
     assert(this._polling)
     if (this._retry_poll && this._control === null) {
+      this._retry_poll = false
       return process.nextTick(() => this._doPoll())
     }
     this._polling = false
@@ -490,9 +507,10 @@ class TorDaemon extends EventEmitter {
 
       const readable = controlSocket
       const writable = controlSocket
-      this._control = new TorControl(readable, writable)
-      this._control.on('error', (err) => this._controlError(err))
-      this._control.on('close', () => this._controlClosed())
+      const control = new TorControl(readable, writable)
+      this._control = control
+      this._control.on('error', (err) => this._controlError(control, err))
+      this._control.on('close', () => this._controlClosed(control))
 
       // We have finished polling, _and_ we are scheduled to be
       // notified either by (a) our file system activity watcher, or
@@ -508,22 +526,16 @@ class TorDaemon extends EventEmitter {
           }
         }
         if (err) {
-          console.log(`tor: authentication failure: ${err}`)
-          this.kill()
-          return
+          return this._error(`authentication failure: ${err}`)
         }
         this._control.getSOCKSListeners((err, listeners) => {
           if (err) {
-            console.log(`tor: failed to get socks addresses: ${err}`)
-            this.kill()
-            return
+            return this._error(`failed to get socks addresses: ${err}`)
           }
           this._socks_addresses = listeners
           this._control.getVersion((err, version) => {
             if (err) {
-              console.log(`tor: failed to get version: ${err}`)
-              this.kill()
-              return
+              return this._error(`failed to get version: ${err}`)
             }
             this._tor_version = version
             this.emit('launch', this.getSOCKSAddress())
@@ -538,12 +550,17 @@ class TorDaemon extends EventEmitter {
    * socket.  Report it to the console and give up by destroying the
    * control connection.
    *
+   * @param {TorControl} control
    * @param {Error} err
    */
-  _controlError (err) {
-    assert(this._control)
+  _controlError (control, err) {
+    if (this._control === control) {
+      this._control = null
+    } else {
+      console.log('tor: control error got deferred')
+    }
     console.log(`tor: control socket error: ${err}`)
-    this._control.destroy(err)
+    control.destroy(err)
   }
 
   /*
@@ -552,10 +569,15 @@ class TorDaemon extends EventEmitter {
    * has exited.
    *
    * TODO(riastradh): Also try to restart tor or anything?
+   *
+   * @param {TorControl} control
    */
-  _controlClosed () {
-    assert(this._control)
-    this._control = null
+  _controlClosed (control) {
+    if (this._control === control) {
+      this._control = null
+    } else {
+      console.log('tor: control closure got deferred')
+    }
     // Assume this means the process exited.
     this.emit('exit')
     // Poll in case we received a watch event for file system activity
@@ -770,6 +792,72 @@ class TorDaemon extends EventEmitter {
     const info = 'status/circuit-established'
     this._torStatus(event, keys, info, handleStatus, handleInfo, callback)
   }
+
+  /**
+   * Arrange to call handler when tor thinks the network is up or
+   * down.  The handler may be called before or after the callback.
+   *
+   * @param {Function(boolean)} handler
+   * @param {Function(Error)} callback
+   */
+  onNetworkLiveness (handler, callback) {
+    const control = this._control
+    // Subscribe to events.
+    const statusListener = (data, extra) => {
+      const liveness = {UP: true, DOWN: false}
+      if (!(data in liveness)) {
+        console.log(`tor: warning: invalid network liveness: ${data}`)
+        return
+      }
+      handler(liveness[data])
+    }
+    control.on('async-NETWORK_LIVENESS', statusListener)
+    control.subscribe('NETWORK_LIVENESS', (err) => {
+      if (err) {
+        control.removeListener('async-NETWORK_LIVENESS', statusListener)
+        return callback(err)
+      }
+      // Run `GETINFO network-liveness' to find out what state we're
+      // in now before the next state change event.
+      let err0 = null
+      const getinfoLine = (status, reply) => {
+        const liveness = {up: true, down: false}
+        if (status !== '250') {
+          err0 = err0 || new Error(`${status} ${reply}`)
+          return
+        }
+        const prefix = 'network-liveness='
+        if (!reply.startsWith(prefix)) {
+          err0 = err0 || new Error(`bogus network-liveness: ${reply}`)
+          return
+        }
+        const data = reply.slice(prefix.length)
+        if (!(data in liveness)) {
+          err0 = err0 || new Error(`bogus network-liveness: ${data}`)
+          return
+        }
+        return handler(liveness[data])
+      }
+      const cmd = 'GETINFO network-liveness'
+      control.cmd(cmd, getinfoLine, (err, status, reply) => {
+        if (!err) {
+          if (err0) {
+            err = err0
+          } else if (status !== '250') {
+            err = new Error(`${status} ${reply}`)
+          }
+        }
+        if (err) {
+          control.removeListener('async-NETWORK_LIVENESS', statusListener)
+          control.unsubscribe('NETWORK_LIVENESS', (err1) => {
+            return callback(err)
+          })
+        }
+        // Success!
+        return callback(null)
+      })
+    })
+  }
 }
 
 /**
@@ -878,10 +966,14 @@ class TorControl extends EventEmitter {
    * - Mark the control closed so it can't be used any more.
    * - Pass an error to all callbacks waiting for command completion.
    *
+   * Idempotent.  Repeated calls have no effect.
+   *
    * @param {Error} err
    */
   destroy (err) {
-    assert(!this._destroyed)
+    if (this._destroyed) {
+      return
+    }
     this._readable.destroy(err)
     this._writable.end()
     this._writable.destroy(err)
@@ -892,11 +984,11 @@ class TorControl extends EventEmitter {
     this._writable.removeListener('error', this._writable_on_error)
     this._writable.removeListener('close', this._writable_on_close)
     this._destroyed = true
+    err = err || new Error('tor: control channel destroyed')
     while (this._cmdq.length > 0) {
       const [, callback] = this._cmdq.shift()
       callback(err, null, null)
     }
-    assert(this._closing === 0)
   }
 
   /**
@@ -939,6 +1031,8 @@ class TorControl extends EventEmitter {
     // If it's an asynchronous reply (status 6yz), pass it on
     // asynchronously.
     if (status[0] === '6') {
+      this.emit('asyncReply', status, reply)
+
       assert(this._async_keyword || this._async_keyword === null)
       assert((this._async_keyword === null) === (this._async_extra === null))
       assert((this._async_keyword === null) === (this._async_skip === null))
@@ -1042,20 +1136,29 @@ class TorControl extends EventEmitter {
   _onEnd () {
     assert(!this._destroyed)
     if (this._cmdq.length > 0) {
-      this._error('tor: control connection closed prematurely')
+      this._error('control connection closed prematurely')
     }
     this.emit('end')
   }
 
   /**
    * Internal subroutine.  Callback for errors on the enclosed
-   * readable or writable.  Pass it along.
+   * readable or writable.  If there are any commands pending, fail
+   * them with this error.  Otherwise, emit an asynchronous 'error'
+   * event.
    *
    * @param {Error} err
    */
   _onError (err) {
-    assert(!this._destroyed)
-    this.emit('error', err)
+    if (this._cmdq.length > 0) {
+      assert(!this._destroyed)
+      do {
+        const [, callback] = this._cmdq.shift()
+        callback(err, null, null)
+      } while (this._cmdq.length > 0)
+    } else {
+      this.emit('error', err)
+    }
   }
 
   /**
@@ -1074,12 +1177,14 @@ class TorControl extends EventEmitter {
   }
 
   /**
-   * Internal subroutine.  Emit an error with a prescribed message.
+   * Internal subroutine.  Pass an error with the prescribed message
+   * to any callbacks, or emit an error with a prescribed message if
+   * there are none.
    *
    * @param {string} msg
    */
   _error (msg) {
-    this.emit('error', new Error(msg))
+    this._onError(new Error(msg))
   }
 
   /**
@@ -1113,6 +1218,7 @@ class TorControl extends EventEmitter {
    * @param {cmdCallback} callback
    */
   cmd (cmdline, perline, callback) {
+    this.emit('cmd', cmdline)
     assert(!this._destroyed)
     this._cmdq.push([perline, callback])
     this._writable.cork()
@@ -1216,7 +1322,7 @@ class TorControl extends EventEmitter {
     if (!(event in this._tor_events)) {
       return process.nextTick(() => callback(null))
     }
-    if (this._tor_events[event]-- === 0) {
+    if (--this._tor_events[event] === 0) {
       delete this._tor_events[event]
       const eventList = Object.keys(this._tor_events).sort().join(' ')
       this.cmd1(`SETEVENTS ${eventList}`, (err, status, reply) => {
@@ -1230,6 +1336,8 @@ class TorControl extends EventEmitter {
         }
         return callback(null)
       })
+    } else {
+      return callback(null)
     }
   }
 

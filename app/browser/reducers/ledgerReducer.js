@@ -12,6 +12,7 @@ const windowConstants = require('../../../js/constants/windowConstants')
 const settings = require('../../../js/constants/settings')
 const tabActionConstants = require('../../common/constants/tabAction')
 const ledgerStatuses = require('../../common/constants/ledgerStatuses')
+const messages = require('../../../js/constants/messages')
 
 // State
 const ledgerState = require('../../common/state/ledgerState')
@@ -159,7 +160,7 @@ const ledgerReducer = (state, action, immutableAction) => {
                 break
               }
               state = ledgerApi.updatePublisherInfo(state)
-              state = ledgerApi.verifiedP(state, publisherKey)
+              state = ledgerApi.updatePublishers(state, publisherKey)
               break
             }
         }
@@ -419,15 +420,6 @@ const ledgerReducer = (state, action, immutableAction) => {
         }
         break
       }
-    case appConstants.APP_ON_PUBLISHER_TIMESTAMP:
-      {
-        const oldValue = ledgerState.getLedgerValue(state, 'publisherTimestamp')
-        state = ledgerState.setLedgerValue(state, 'publisherTimestamp', action.get('timestamp'))
-        if (action.get('updateList')) {
-          ledgerApi.onPublisherTimestamp(state, oldValue, action.get('timestamp'))
-        }
-        break
-      }
     case appConstants.APP_SAVE_LEDGER_PROMOTION:
       {
         state = ledgerState.savePromotion(state, action.get('promotion'))
@@ -576,8 +568,59 @@ const ledgerReducer = (state, action, immutableAction) => {
         state = ledgerApi.pageDataChanged(state, viewData, true)
         break
       }
+    case appConstants.APP_ON_NOTIFICATION_RESPONSE:
+      {
+        state = ledgerNotifications.onResponse(
+          state,
+          action.get('message'),
+          action.get('buttonIndex'),
+          action.get('activeWindow')
+        )
+        break
+      }
+    case appConstants.APP_ON_PUBLISHERS_INFO_RECEIVED:
+      {
+        state = ledgerApi.onPublishersInfo(state, action.get('result'))
+        break
+      }
+    case appConstants.APP_ON_PUBLISHERS_INFO_WRITE:
+      {
+        state = updateState.setUpdateProp(state, 'verifiedPublishersTimestamp', new Date().getTime())
+        break
+      }
+    case appConstants.APP_ON_PUBLISHERS_INFO_READ:
+      {
+        const keys = action.get('keys')
+
+        if (!keys) {
+          break
+        }
+
+        const publisherKeys = makeImmutable(keys)
+        state = ledgerApi.updatePublishersInfo(
+          state,
+          publisherKeys,
+          action.get('data')
+        )
+        break
+      }
+    case appConstants.APP_ON_CHECK_BROWSER_ACTIVITY_TIME:
+      {
+        state = ledgerApi.checkBrowserActivityTime(state)
+        break
+      }
+    case appConstants.APP_ON_PROMO_REF_FETCH:
+      {
+        state = ledgerApi.onRunPromoRefFetch(state)
+        break
+      }
   }
   return state
 }
+
+process.on(messages.APP_INITIALIZED, () => {
+  ledgerApi.runPromotionCheck()
+  ledgerApi.schedulePromoRefFetch()
+})
 
 module.exports = ledgerReducer

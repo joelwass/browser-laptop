@@ -10,7 +10,7 @@ const tabState = require('../common/state/tabState')
 const {app, extensions, session, ipcMain} = require('electron')
 const {makeImmutable, makeJS} = require('../common/state/immutableUtil')
 const {getExtensionsPath, getTargetAboutUrl, getSourceAboutUrl, isSourceAboutUrl, newFrameUrl, isTargetAboutUrl, isIntermediateAboutPage, isTargetMagnetUrl, getSourceMagnetUrl} = require('../../js/lib/appUrlUtil')
-const {isURL, getUrlFromInput, toPDFJSLocation, getDefaultFaviconUrl, isHttpOrHttps, getLocationIfPDF} = require('../../js/lib/urlutil')
+const {isURL, getUrlFromInput, getDefaultFaviconUrl, isHttpOrHttps, getLocationIfPDF} = require('../../js/lib/urlutil')
 const {isSessionPartition, isTor} = require('../../js/state/frameStateUtil')
 const {getOrigin} = require('../../js/lib/urlutil')
 const settingsStore = require('../../js/settings')
@@ -53,9 +53,6 @@ const normalizeUrl = function (url) {
   if (isURL(url)) {
     url = getUrlFromInput(url)
   }
-  if (settingsStore.getSetting(settings.PDFJS_ENABLED)) {
-    url = toPDFJSLocation(url)
-  }
   return url
 }
 
@@ -93,6 +90,18 @@ const updateTab = (tabId, changeInfo = {}) => {
 
 const getPartitionNumber = (partition) => {
   return Number(partition.split('persist:partition-')[1] || 0)
+}
+
+const shouldWaitForTorLoad = (webContents, appState) => {
+  if (webContents &&
+    webContents.session &&
+    webContents.session.partition === appConfig.tor.partition) {
+    appState = appState || appStore.getState()
+    if (appState.getIn(['tor', 'online']) !== true) {
+      console.log('Blocking page load until Tor tab is initialized')
+      return true
+    }
+  }
 }
 
 /**
@@ -905,6 +914,9 @@ const api = {
     action = makeImmutable(action)
     const tabId = action.get('tabId')
     const tab = webContentsCache.getWebContents(tabId)
+    if (shouldWaitForTorLoad(tab)) {
+      return
+    }
     if (tab && !tab.isDestroyed()) {
       const url = normalizeUrl(action.get('url'))
       const currentUrl = tab.getURL()
@@ -944,6 +956,9 @@ const api = {
 
   loadURLInTab: (state, tabId, url) => {
     const tab = webContentsCache.getWebContents(tabId)
+    if (shouldWaitForTorLoad(tab)) {
+      return
+    }
     if (tab && !tab.isDestroyed()) {
       url = normalizeUrl(url)
       tab.loadURL(url)

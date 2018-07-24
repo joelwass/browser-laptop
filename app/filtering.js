@@ -29,7 +29,7 @@ const ipcMain = electron.ipcMain
 const app = electron.app
 const path = require('path')
 const getOrigin = require('../js/lib/urlutil').getOrigin
-const {isTorrentFile, isMagnetURL} = require('./browser/webtorrent')
+const {isTorrentFile} = require('./browser/webtorrent')
 const {adBlockResourceName} = require('./adBlock')
 const {updateElectronDownloadItem} = require('./browser/electronDownloadItem')
 const {fullscreenOption} = require('./common/constants/settingsEnums')
@@ -49,7 +49,7 @@ const beforeSendHeadersFilteringFns = []
 const beforeRequestFilteringFns = []
 const beforeRedirectFilteringFns = []
 const headersReceivedFilteringFns = []
-let partitionsToInitialize = ['default', appConfig.tor.partition]
+let partitionsToInitialize = ['default']
 let initializedPartitions = {}
 
 const transparent1pxGif = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
@@ -103,6 +103,13 @@ module.exports.registerHeadersReceivedFilteringCB = (filteringFn) => {
   headersReceivedFilteringFns.push(filteringFn)
 }
 
+// Protocols which are safe to load in tor tabs
+const whitelistedTorProtocols = ['http:', 'https:', 'chrome-extension:', 'chrome-devtools:']
+if (process.env.NODE_ENV === 'development') {
+  // Needed for connection to webpack local server
+  whitelistedTorProtocols.push('ws:')
+}
+
 /**
  * Register for notifications for webRequest.onBeforeRequest for a particular
  * session.
@@ -111,6 +118,29 @@ module.exports.registerHeadersReceivedFilteringCB = (filteringFn) => {
 function registerForBeforeRequest (session, partition) {
   const isPrivate = module.exports.isPrivate(partition)
   session.webRequest.onBeforeRequest((details, muonCb) => {
+    if (partition === appConfig.tor.partition) {
+      if (!details.url) {
+        muonCb({ cancel: true })
+        return
+      }
+      // To minimize leakage risk, only allow whitelisted protocols in Tor
+      // sessions
+      const protocol = urlParse(details.url).protocol
+      if (!whitelistedTorProtocols.includes(protocol)) {
+        onBlockedInTor(details, muonCb)
+        return
+      }
+    } else {
+      const hostname = urlParse(details.url).hostname
+      // US-ASCII only in `.onion', so no need for locale-dependent
+      // case-insensitive comparisons.
+      if (typeof hostname === 'string' &&
+          hostname.toLowerCase().endsWith('.onion')) {
+        onBlockedOutsideTor(details, muonCb)
+        return
+      }
+    }
+
     if (process.env.NODE_ENV === 'development') {
       let page = appUrlUtil.getGenDir(details.url)
       if (page) {
@@ -133,11 +163,6 @@ function registerForBeforeRequest (session, partition) {
 
     if (shouldIgnoreUrl(details)) {
       muonCb({})
-      return
-    }
-
-    if ((isMagnetURL(details)) && partition === appConfig.tor.partition) {
-      showTorrentBlockedInTorWarning(details, muonCb)
       return
     }
 
@@ -377,17 +402,25 @@ function registerForBeforeSendHeaders (session, partition) {
   })
 }
 
-function showTorrentBlockedInTorWarning (details, muonCb) {
+function onBlocked (reasonKey, details, muonCb) {
   const cb = () => muonCb({cancel: true})
-  if (details.tabId) {
+  if (details.tabId && details.resourceType === 'mainFrame') {
     tabMessageBox.show(details.tabId, {
-      message: `${locale.translation('torrentBlockedInTor')}`,
+      message: `${locale.translation(reasonKey)}`,
       title: 'Brave',
-      buttons: [locale.translation('torrentWarningOk')]
+      buttons: [locale.translation('urlWarningOk')]
     }, cb)
   } else {
     cb()
   }
+}
+
+function onBlockedInTor (details, muonCb) {
+  onBlocked('urlBlockedInTor', details, muonCb)
+}
+
+function onBlockedOutsideTor (details, muonCb) {
+  onBlocked('urlBlockedOutsideTor', details, muonCb)
 }
 
 /**
@@ -404,7 +437,7 @@ function registerForHeadersReceived (session, partition) {
       return
     }
     if ((isTorrentFile(details)) && partition === appConfig.tor.partition) {
-      showTorrentBlockedInTorWarning(details, muonCb)
+      onBlockedInTor(details, muonCb)
       return
     }
     const firstPartyUrl = module.exports.getMainFrameUrl(details)
@@ -732,11 +765,12 @@ module.exports.relaunchTor = () => {
     console.log('Tor session no longer exists. Cannot restart Tor.')
     return
   }
-  appActions.onTorInitError(null)
+  appActions.onTorOnline(false)
   try {
+    console.log('tor: relaunch')
     ses.relaunchTor()
   } catch (e) {
-    appActions.onTorInitError(`Could not restart Tor: ${e}`)
+    appActions.onTorError(`Could not restart Tor: ${e}`)
   }
 }
 
@@ -777,7 +811,7 @@ const initPartition = (partition) => {
     try {
       setupTor()
     } catch (e) {
-      appActions.onTorInitError(`Could not start Tor: ${e}`)
+      appActions.onTorError(`Could not start Tor: ${e}`)
     }
     // TODO(riastradh): Duplicate logic in app/browser/tabs.js.
     options.isolated_storage = true
@@ -808,22 +842,29 @@ const initPartition = (partition) => {
 module.exports.initPartition = initPartition
 
 function setupTor () {
-  let torInitialized = null
-  const setTorErrorOnTimeout = (timeout, msg) => {
-    torInitialized = null
-    setTimeout(() => {
-      if (torInitialized === null) {
-        appActions.onTorInitError(msg)
-      }
-    }, timeout)
+  let timer = null
+  const setTorErrorOnTimeout = (delay, msg) => {
+    if (timer === null) {
+      timer = setTimeout(() => {
+        appActions.onTorError(msg)
+        console.log(`tor timeout: ${msg}`)
+      }, delay)
+    }
   }
-  const onTorSuccess = () => {
-    torInitialized = true
-    appActions.onTorInitSuccess()
+  const initialized = () => {
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+    }
   }
-  const onTorFail = (msg) => {
-    torInitialized = false
-    appActions.onTorInitError(msg)
+  const onTorError = (msg) => {
+    initialized()
+    appActions.onTorError(msg)
+    console.warn(`tor error: ${msg}`)
+  }
+  const onTorOnline = (online) => {
+    initialized()
+    appActions.onTorOnline(online)
   }
   // If Tor has not successfully initialized or thrown an error within 20s,
   // assume it's broken.
@@ -834,12 +875,11 @@ function setupTor () {
   const torDaemon = new tor.TorDaemon()
   torDaemon.setup((err) => {
     if (err) {
-      onTorFail(`Tor failed to make directories: ${err}`)
+      onTorError(`Tor failed to make directories: ${err}`)
       return
     }
-    torDaemon.on('exit', () => {
-      onTorFail('The Tor process has stopped.')
-    })
+    torDaemon.on('exit', () => onTorError('The Tor process has exited.'))
+    torDaemon.on('error', (err) => onTorError(`${err}`))
     torDaemon.on('launch', (socksAddr) => {
       const version = torDaemon.getVersion()
       console.log(`tor: daemon listens on ${socksAddr}, version ${version}`)
@@ -848,35 +888,52 @@ function setupTor () {
       }
       const bootstrapped = (err, progress) => {
         if (err) {
-          onTorFail(`Tor bootstrap error: ${err}`)
+          console.warn(`tor: bootstrap ${progress}% error: ${err}`)
+          onTorError(`Tor bootstrap error: ${err}`)
           return
         }
         appActions.onTorInitPercentage(progress)
       }
-      const circuitEstablished = (err, ok) => {
-        if (ok) {
-          console.log('Tor ready!')
-          onTorSuccess()
-        } else {
-          if (err) {
-            // Wait for tor to re-initialize a circuit (ex: after a clock jump)
-            appActions.onTorInitPercentage('0')
-            setTorErrorOnTimeout(17000, `Tor not ready: ${err}`)
-          } else {
-            // Simply log the error but don't show error UI since Tor might
-            // finish opening a circuit.
-            console.log('tor still not ready')
-          }
+      const networkLiveness = (live) => {
+        if (live) {
+          // Network is now live.
+          onTorOnline(true)
+        } else if (timer === null) {
+          // We were online before; now we are not.
+          onTorOnline(false)
+          // Wait for tor to reconnect.
+          setTorErrorOnTimeout(17000, 'Tor could not reconnect.')
+        }
+      }
+      const circuitEstablished = (err, established) => {
+        if (err && established === null) {
+          onTorError(`Tor circuit error: ${err}`)
+          return
+        }
+        if (established) {
+          // Circuit is now established.
+          onTorOnline(true)
+        } else if (timer === null) {
+          // We were online before; now we are not.
+          onTorOnline(false)
+          // Wait for tor to reconnect.
+          setTorErrorOnTimeout(17000, 'Tor could not reconnect.')
         }
       }
       torDaemon.onBootstrap(bootstrapped, (err) => {
         if (err) {
-          onTorFail(`Tor error bootstrapping: ${err}`)
+          onTorError(`Tor error subscribing to bootstrap event: ${err}`)
         }
-        torDaemon.onCircuitEstablished(circuitEstablished, (err) => {
+        torDaemon.onNetworkLiveness(networkLiveness, (err) => {
           if (err) {
-            onTorFail(`Tor error opening a circuit: ${err}`)
+            onTorError(`Tor error subscribing to network liveness: ${err}`)
           }
+          torDaemon.onCircuitEstablished(circuitEstablished, (err) => {
+            if (err) {
+              onTorError(
+                `Tor error subscribing to circuit establishment: ${err}`)
+            }
+          })
         })
       })
     })
